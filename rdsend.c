@@ -79,10 +79,34 @@ static int write_full(int fd, const void *buf, size_t len) {
   return 0;
 }
 
+
+/* Path MTU: the smaller of the two ports' advertised max_mtu, overridable with
+ * RDMA_PATH_MTU=512|1024|2048|4096. Some fabrics advertise a larger port MTU
+ * than the link actually carries, which shows up as a transport retry
+ * counter exceeded once bulk writes start. */
+static enum ibv_mtu pick_path_mtu(enum ibv_mtu local_max, enum ibv_mtu remote_max,
+                                  const char *prog) {
+  enum ibv_mtu m = local_max < remote_max ? local_max : remote_max;
+  const char *env = getenv("RDMA_PATH_MTU");
+  if (!env) return m;
+  int v = atoi(env);
+  switch (v) {
+    case 4096: return IBV_MTU_4096;
+    case 2048: return IBV_MTU_2048;
+    case 1024: return IBV_MTU_1024;
+    case 512:  return IBV_MTU_512;
+    default:
+      fprintf(stderr, "%s: invalid RDMA_PATH_MTU '%s' (expected 512|1024|2048|4096)\n", prog, env);
+      return (enum ibv_mtu) -1;
+  }
+}
+
 struct qp_info {
   uint32_t qpn;
   uint32_t psn;
   union ibv_gid gid;
+  uint32_t lid;
+  uint32_t max_mtu;
 };
 
 /* Sent by rdsend to rdrecv before RDMA setup so rdrecv can allocate correctly */
@@ -908,10 +932,19 @@ int main(int argc, char *argv[]) {
 
   /* Exchange QP info over the same TCP connection */
   uint32_t local_psn = (uint32_t)(lrand48() & 0xFFFFFF);
+  uint32_t local_lid = 0;
+  struct ibv_port_attr local_pattr;
+  enum ibv_mtu local_max_mtu = IBV_MTU_4096;
+  if (ibv_query_port(ctx, port_num, &local_pattr) == 0) {
+    local_lid = local_pattr.lid;
+    local_max_mtu = local_pattr.max_mtu;
+  }
   struct qp_info local_info = {
       .qpn = qp->qp_num,
       .psn = local_psn,
       .gid = local_gid,
+      .lid = local_lid,
+      .max_mtu = (uint32_t) local_max_mtu,
   };
   struct qp_info remote_info;
 
@@ -931,9 +964,11 @@ int main(int argc, char *argv[]) {
   close(tcp_sock);
 
   // Move QP to RTR
+  enum ibv_mtu path_mtu = pick_path_mtu(local_max_mtu, (enum ibv_mtu) remote_info.max_mtu, "rdsend");
+  if ((int) path_mtu < 0) return EXIT_FAILURE;
   struct ibv_qp_attr rtr_attr = {
       .qp_state = IBV_QPS_RTR,
-      .path_mtu = IBV_MTU_4096,
+      .path_mtu = path_mtu,
       .dest_qp_num = remote_info.qpn,
       .rq_psn = remote_info.psn,
       .max_dest_rd_atomic = 1,
@@ -941,6 +976,7 @@ int main(int argc, char *argv[]) {
       .ah_attr =
           {
               .is_global = 1,
+              .dlid = remote_info.lid,
               .grh =
                   {
                       .dgid = remote_info.gid,
@@ -1160,6 +1196,8 @@ int main(int argc, char *argv[]) {
         continue;
       }
       if (wc.status != IBV_WC_SUCCESS) {
+        if (wc.vendor_err == 129)
+          fprintf(stderr, "rdsend: the fabric dropped packets at path MTU %u bytes; retry with RDMA_PATH_MTU=2048 (or 1024/512)\n", (unsigned) path_mtu);
         fprintf(stderr, "rdsend: pipeline completion failed: %s (vendor_err=%u)\n",
                 ibv_wc_status_str(wc.status), wc.vendor_err);
         failed = 1; break;

@@ -123,10 +123,34 @@ static int write_chunk_parallel(int fd, const void *buf, size_t len,
   return 0;
 }
 
+
+/* Path MTU: the smaller of the two ports' advertised max_mtu, overridable with
+ * RDMA_PATH_MTU=512|1024|2048|4096. Some fabrics advertise a larger port MTU
+ * than the link actually carries, which shows up as a transport retry
+ * counter exceeded once bulk writes start. */
+static enum ibv_mtu pick_path_mtu(enum ibv_mtu local_max, enum ibv_mtu remote_max,
+                                  const char *prog) {
+  enum ibv_mtu m = local_max < remote_max ? local_max : remote_max;
+  const char *env = getenv("RDMA_PATH_MTU");
+  if (!env) return m;
+  int v = atoi(env);
+  switch (v) {
+    case 4096: return IBV_MTU_4096;
+    case 2048: return IBV_MTU_2048;
+    case 1024: return IBV_MTU_1024;
+    case 512:  return IBV_MTU_512;
+    default:
+      fprintf(stderr, "%s: invalid RDMA_PATH_MTU '%s' (expected 512|1024|2048|4096)\n", prog, env);
+      return (enum ibv_mtu) -1;
+  }
+}
+
 struct qp_info {
   uint32_t qpn;
   uint32_t psn;
   union ibv_gid gid;
+  uint32_t lid;
+  uint32_t max_mtu;
 };
 
 struct rdma_params {
@@ -924,7 +948,14 @@ int main(int argc, char *argv[]) {
   /* QP handshake */
   TS("QP ready");
   uint32_t local_psn = (uint32_t)(lrand48() & 0xFFFFFF);
-  struct qp_info local_info  = { .qpn=qp->qp_num, .psn=local_psn, .gid=local_gid };
+  uint32_t local_lid = 0;
+  struct ibv_port_attr local_pattr;
+  enum ibv_mtu local_max_mtu = IBV_MTU_4096;
+  if (ibv_query_port(ctx, port_num, &local_pattr) == 0) {
+    local_lid = local_pattr.lid;
+    local_max_mtu = local_pattr.max_mtu;
+  }
+  struct qp_info local_info  = { .qpn=qp->qp_num, .psn=local_psn, .gid=local_gid, .lid=local_lid, .max_mtu=(uint32_t)local_max_mtu };
   struct qp_info remote_info;
   int hs_n = write_full(tcp_sock, &local_info, sizeof(local_info));
   if (hs_n != 0) {
@@ -940,13 +971,15 @@ int main(int argc, char *argv[]) {
   double ctrl_rtt_ms = tcp_rtt_ms(tcp_sock);
   close(tcp_sock);
 
+  enum ibv_mtu path_mtu = pick_path_mtu(local_max_mtu, (enum ibv_mtu) remote_info.max_mtu, "rdrecv");
+  if ((int) path_mtu < 0) return EXIT_FAILURE;
   struct ibv_qp_attr rtr_attr = {
-    .qp_state=IBV_QPS_RTR, .path_mtu=IBV_MTU_4096,
+    .qp_state=IBV_QPS_RTR, .path_mtu=path_mtu,
     .dest_qp_num=remote_info.qpn, .rq_psn=remote_info.psn,
     .max_dest_rd_atomic=1, .min_rnr_timer=12,
     .ah_attr={ .is_global=1,
                .grh={ .dgid=remote_info.gid, .sgid_index=gid_idx, .hop_limit=64 },
-               .sl=0, .port_num=port_num },
+               .sl=0, .dlid=remote_info.lid, .port_num=port_num },
   };
   if (ibv_modify_qp(qp, &rtr_attr,
                     IBV_QP_STATE|IBV_QP_AV|IBV_QP_PATH_MTU|IBV_QP_DEST_QPN|
@@ -1102,6 +1135,19 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
       }
       if (wc.status != IBV_WC_SUCCESS) {
+        if (wc.opcode == IBV_WC_SEND) {
+        /*
+         * Ack SENDs are advisory: the data they acknowledge has already been
+         * DMA-written into the destination. A sender that tears its QP down
+         * first makes these fail with transport-retry-exceeded, so a failed
+         * ack must not abort finalization (which truncates the file).
+         */
+          fprintf(stderr, "rdrecv: ack completion failed: %s (vendor_err=%u, wr_id=%llu); continuing\n",
+                  ibv_wc_status_str(wc.status), wc.vendor_err,
+                  (unsigned long long)wc.wr_id);
+          if (ack_pending > 0) ack_pending--;
+          continue;
+        }
         fprintf(stderr, "rdrecv: pipeline completion failed: %s (vendor_err=%u, wr_id=%llu)\n",
                 ibv_wc_status_str(wc.status), wc.vendor_err,
                 (unsigned long long)wc.wr_id);

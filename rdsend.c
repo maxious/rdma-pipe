@@ -47,7 +47,7 @@ int rconnect(char *host, char *port, struct rdma_event_channel *cm_channel,
              uint32_t buf_len, struct pdata *server_pdata) {
   struct rdma_conn_param conn_param = {};
   struct addrinfo *res, *t;
-  struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+  struct addrinfo hints = {.ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM};
   struct ibv_qp_init_attr qp_attr = {};
   int n;
   struct rdma_cm_event *event;

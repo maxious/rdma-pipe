@@ -18,6 +18,27 @@ target=${@:$OPTIND+1:1}
 ssh=$(which ssh)
 ssh_flags="-t -t -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=1"
 
+# Split a "host:path" argument into host and path.
+# IPv6 addresses contain colons, so they are written bracketed
+# ("[fd00::1]:path", "[fe80::1%ibp4s0]:path") or split at the last colon.
+split_host_path() {
+    local val="$1"
+    if [[ "$val" == "["*"]:"* ]]; then
+        host=${val#*[}
+        host=${host%]*}
+        path=${val#*]:}
+    elif [[ "$val" != *":"* ]]; then
+        host=""
+        path="$val"
+    elif [[ "${val%:*}" =~ ^[0-9a-fA-F]+(:[0-9a-fA-F]*)+$ ]]; then
+        host=${val%:*}
+        path=${val##*:}
+    else
+        host=${val%%:*}
+        path=${val#*:}
+    fi
+}
+
 # Split the host:filename into host and filename
 # If there is no : set host to ""
 
@@ -25,38 +46,24 @@ if [ "$source" = "" ]; then
     echo "Usage: $0 [-v] [-r] source target"
     exit
 fi
-# Check if source contains a colon
-if [[ $source == *":"* ]]; then
-    # Split source into host and filename
-    source_host=${source%%:*}
-    source_filename=${source#*:}
-else
-    # No colon, so set host to ""
-    source_host=""
-    source_filename=$source
-    if [ $source_filename = "-" ]
-    then
-        source_filename="/dev/stdin"
-    fi
+split_host_path "$source"
+source_host=$host
+source_filename=$path
+if [ "$source_host" = "" ] && [ "$source_filename" = "-" ]
+then
+    source_filename="/dev/stdin"
 fi
 
 if [ "$target" = "" ]; then
     echo "Usage: $0 [-v] [-r] source target"
     exit
 fi
-# Check if target contains a colon
-if [[ $target == *":"* ]]; then
-    # Split target into host and filename
-    target_host=${target%%:*}
-    target_filename=${target#*:}
-else
-    # No colon, so set host to ""
-    target_host=""
-    target_filename=$target
-    if [ $target_filename = "-" ]
-    then
-        target_filename="/dev/stdout"
-    fi
+split_host_path "$target"
+target_host=$host
+target_filename=$path
+if [ "$target_host" = "" ] && [ "$target_filename" = "-" ]
+then
+    target_filename="/dev/stdout"
 fi
 
 # Check if source is a directory and -r flag is not set

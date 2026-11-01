@@ -67,7 +67,7 @@ int main(int argc, char *argv[]) {
   struct ibv_wc wc;
   void *cq_context;
 
-  struct sockaddr_in sin;
+  struct sockaddr_in6 sin;
 
   uint32_t *buf, *buf2, *tmp;
   // 8 MiB
@@ -141,9 +141,9 @@ int main(int argc, char *argv[]) {
   if (err)
     return err;
 
-  sin.sin_family = AF_INET;
-  sin.sin_port = htons(port);
-  sin.sin_addr.s_addr = INADDR_ANY;
+  sin.sin6_family = AF_INET6;
+  sin.sin6_port = htons(port);
+  sin.sin6_addr = in6addr_any;
 
   /* Bind to local port and listen for connection request */
 

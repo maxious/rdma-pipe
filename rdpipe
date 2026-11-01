@@ -62,7 +62,19 @@ key = rand.to_s
 # rdsend tries to open a connection until the other side has a port open or timeout happens.
 #
 
-hostcmds = ARGV.map {|arg| arg.split(":", 2) }
+# Split "host:cmd" into host and cmd. IPv6 addresses contain colons, so a
+# bracketed host ("[fd00::1]:cmd") or a bare IPv6 host splits at the last colon.
+def split_host_cmd(arg)
+	if arg =~ /\A\[([^\]]+)\]:?(.*)\z/
+		[$1, $2]
+	elsif arg =~ /\A([0-9a-fA-F]+(?::[0-9a-fA-F]*)+):(.*)\z/
+		[$1, $2]
+	else
+		arg.split(":", 2)
+	end
+end
+
+hostcmds = ARGV.map {|arg| split_host_cmd(arg) }
 hosts = hostcmds.map{|hc| hc[0] }
 hosts.push(localhost)
 

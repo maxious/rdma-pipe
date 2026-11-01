@@ -143,72 +143,56 @@ static int gid_is_roce_v2(const char *devname, uint8_t port, int gidx) {
 
 // Find the ibv_context and port for the device whose RoCEv2 GID matches the
 // local IP used to route to target_ip.
+static void gid_target_from_addr(const struct sockaddr *sa, uint8_t out[16]) {
+  memset(out, 0, 16);
+  if (sa->sa_family == AF_INET) { out[10] = 0xFF; out[11] = 0xFF;
+    memcpy(out + 12, &((const struct sockaddr_in *)sa)->sin_addr, 4); }
+  else if (sa->sa_family == AF_INET6) memcpy(out, &((const struct sockaddr_in6 *)sa)->sin6_addr, 16);
+}
+
 struct ibv_context *find_rdma_device(const char *target_ip, uint8_t *port_out,
                                      int *gid_idx_out, union ibv_gid *gid_out, int verbose) {
-  // Find which local IP routes to target
-  int sock = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sock < 0) return NULL;
-  struct sockaddr_in remote = {
-      .sin_family = AF_INET,
-      .sin_port = htons(1),
-  };
-  inet_aton(target_ip, &remote.sin_addr);
-  if (connect(sock, (struct sockaddr *)&remote, sizeof(remote)) < 0) {
-    close(sock);
-    return NULL;
-  }
-  struct sockaddr_in local;
-  socklen_t slen = sizeof(local);
+  struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM };
+  struct addrinfo *res = NULL;
+  if (getaddrinfo(target_ip, "1", &hints, &res) != 0) return NULL;
+  int sock = socket(res->ai_family, SOCK_DGRAM, 0);
+  if (sock < 0) { freeaddrinfo(res); return NULL; }
+  if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) { close(sock); freeaddrinfo(res); return NULL; }
+  struct sockaddr_in6 local; socklen_t slen = sizeof(local);
   getsockname(sock, (struct sockaddr *)&local, &slen);
-  close(sock);
-  uint32_t local_ip = local.sin_addr.s_addr; // network byte order
-
-  if (verbose) fprintf(stderr, "DEBUG: local_ip = %08x (looking for RoCEv2 GID)\n", local_ip);
-
-  int num_devices;
-  struct ibv_device **devlist = ibv_get_device_list(&num_devices);
+  close(sock); freeaddrinfo(res);
+  uint8_t gid_target[16];
+  gid_target_from_addr((struct sockaddr *)&local, gid_target);
+  if (verbose) { char ipbuf[INET6_ADDRSTRLEN] = "?";
+    inet_ntop(local.sin6_family, &local.sin6_addr, ipbuf, sizeof(ipbuf));
+    fprintf(stderr, "DEBUG: local address %s (looking for matching GID)\n", ipbuf); }
+  int num_devices; struct ibv_device **devlist = ibv_get_device_list(&num_devices);
   if (!devlist) return NULL;
-
+  struct ibv_context *fallback_ctx = NULL; uint8_t fallback_port = 0; int fallback_gidx = 0; union ibv_gid fallback_gid;
   for (int i = 0; i < num_devices; i++) {
     if (verbose) fprintf(stderr, "DEBUG: checking device %s\n", ibv_get_device_name(devlist[i]));
-    struct ibv_context *ctx = ibv_open_device(devlist[i]);
-    if (!ctx) continue;
-
-    struct ibv_device_attr attr;
-    if (ibv_query_device(ctx, &attr)) {
-      ibv_close_device(ctx);
-      continue;
-    }
-
+    struct ibv_context *ctx = ibv_open_device(devlist[i]); if (!ctx) continue;
+    struct ibv_device_attr attr; if (ibv_query_device(ctx, &attr)) { ibv_close_device(ctx); continue; }
     for (uint8_t port = 1; port <= attr.phys_port_cnt; port++) {
-      struct ibv_port_attr pattr;
-      if (ibv_query_port(ctx, port, &pattr)) continue;
+      struct ibv_port_attr pattr; if (ibv_query_port(ctx, port, &pattr)) continue;
       if (pattr.state != IBV_PORT_ACTIVE) continue;
-
       for (int gidx = 0; gidx < pattr.gid_tbl_len; gidx++) {
-        union ibv_gid gid;
-        if (ibv_query_gid(ctx, port, gidx, &gid)) continue;
-        // RoCEv2 IPv4-mapped GID: bytes 0-9 are zero, 10-11 are 0xFF,
-        // bytes 12-15 are the IPv4 address.
-        int is_roce_v2 = gid_is_roce_v2(ibv_get_device_name(devlist[i]), port, gidx);
-        if (gid.raw[10] == 0xFF && gid.raw[11] == 0xFF) {
-          uint32_t gid_ip;
-          memcpy(&gid_ip, &gid.raw[12], 4);
-          if (verbose) fprintf(stderr, "DEBUG:  gid[%d]: ip=%08x local=%08x roce_v2=%d\n",
-                  gidx, gid_ip, local_ip, is_roce_v2);
-          if (gid_ip == local_ip && is_roce_v2) {
-            *port_out = port;
-            *gid_idx_out = gidx;
-            *gid_out = gid;
-            ibv_free_device_list(devlist);
-            return ctx;
-          }
+        union ibv_gid gid; if (ibv_query_gid(ctx, port, gidx, &gid)) continue;
+        union ibv_gid zero = { .raw = { 0 } };
+        int v4m = gid_target[10] == 0xFF && gid_target[11] == 0xFF && memcmp(gid_target, zero.raw, 10) == 0;
+        if (memcmp(gid.raw, gid_target, 16) == 0 && (!v4m || gid_is_roce_v2(ibv_get_device_name(devlist[i]), port, gidx))) {
+          *port_out = port; *gid_idx_out = gidx; *gid_out = gid;
+          ibv_free_device_list(devlist); return ctx;
+        }
+        if (!fallback_ctx && !v4m && memcmp(gid.raw, zero.raw, 16) != 0) {
+          fallback_ctx = ctx; fallback_port = port; fallback_gidx = gidx; fallback_gid = gid;
         }
       }
     }
-    ibv_close_device(ctx);
+    if (fallback_ctx != ctx) ibv_close_device(ctx);
   }
   ibv_free_device_list(devlist);
+  if (fallback_ctx) { *port_out = fallback_port; *gid_idx_out = fallback_gidx; *gid_out = fallback_gid; return fallback_ctx; }
   return NULL;
 }
 
@@ -477,15 +461,18 @@ static int choose_qp_timeout(double rtt, int verbose) {
 /* Speed of the interface that owns the local address of `sock`, in Gb/s
  * (from /sys/class/net/<if>/speed); -1 if unknown (e.g. some VLAN devices). */
 static double link_gbps_for_socket(int sock, char *ifname, size_t ifname_len) {
-  struct sockaddr_in la;
+  struct sockaddr_in6 la;
   socklen_t ll = sizeof(la);
   if (getsockname(sock, (struct sockaddr *)&la, &ll) != 0) return -1.0;
+  uint8_t la_target[16];
+  gid_target_from_addr((struct sockaddr *)&la, la_target);
   struct ifaddrs *ifs = NULL, *it;
   if (getifaddrs(&ifs) != 0) return -1.0;
   double gbps = -1.0;
   for (it = ifs; it; it = it->ifa_next) {
-    if (!it->ifa_addr || it->ifa_addr->sa_family != AF_INET) continue;
-    if (((struct sockaddr_in *)it->ifa_addr)->sin_addr.s_addr != la.sin_addr.s_addr) continue;
+    if (!it->ifa_addr || (it->ifa_addr->sa_family != AF_INET && it->ifa_addr->sa_family != AF_INET6)) continue;
+    uint8_t ifa_target[16]; gid_target_from_addr(it->ifa_addr, ifa_target);
+    if (memcmp(ifa_target, la_target, 16) != 0) continue;
     snprintf(ifname, ifname_len, "%s", it->ifa_name);
     char path[256];
     snprintf(path, sizeof(path), "/sys/class/net/%s/speed", it->ifa_name);
@@ -668,12 +655,12 @@ int main(int argc, char *argv[]) {
 
   /* Connect TCP and send params to rdrecv before allocating buffers.
    * This lets rdrecv allocate the right size ring immediately. */
-  struct sockaddr_in addr = {
-      .sin_family = AF_INET,
-      .sin_port = htons(port),
-  };
-  if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) {
-    fprintf(stderr, "rdsend: target '%s' is not a numeric IPv4 address; use the receiver's IPv4 address\n", host);
+  struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM };
+  char portstr[16]; snprintf(portstr, sizeof(portstr), "%d", port);
+  struct addrinfo *res = NULL;
+  int gai = getaddrinfo(host, portstr, &hints, &res);
+  if (gai != 0) {
+    fprintf(stderr, "rdsend: cannot resolve target '%s': %s\n", host, gai_strerror(gai));
     if (fd != STDIN_FILENO) close(fd);
     return EXIT_FAILURE;
   }
@@ -682,13 +669,13 @@ int main(int argc, char *argv[]) {
   int retries = 0;
   int last_connect_errno = 0;
   while (tcp_sock < 0) {
-    int candidate = socket(AF_INET, SOCK_STREAM, 0);
+    int candidate = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (candidate < 0) {
       fprintf(stderr, "rdsend: socket creation failed: %s\n", strerror(errno));
       if (fd != STDIN_FILENO) close(fd);
       return EXIT_FAILURE;
     }
-    if (connect(candidate, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+    if (connect(candidate, res->ai_addr, res->ai_addrlen) == 0) {
       tcp_sock = candidate;
       break;
     }

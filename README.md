@@ -231,6 +231,29 @@ redirects the input to <code>/dev/null</code>: <code>rdrecv > /dev/null; rdsend 
 an empty stream to the next host: <code>rdrecv > $cmd; rdsend next_host</code>
 
 
+# IPv6
+
+`rdsend` resolves both IPv4 and IPv6 targets, and `rdrecv` listens on the IPv6
+wildcard address, which also accepts IPv4 clients. The RDMA device is chosen by
+matching the socket address against the port GID table; on a plain InfiniBand
+link, whose GID table carries only the link-local EUI64 GID, the first non-zero
+GID is used instead. The copy stays at RDMA level - no IPoIB is involved.
+
+```bash
+[receiving-host]$ rdrecv 12345 some_key_string
+[sending-host]$ rdsend fd00:98f2:b3ff::1 12345 some_key_string big_file
+```
+
+In `rdcp` and `rdpipe` an IPv6 host is written with brackets, because the address
+itself contains colons:
+
+```bash
+$ rdcp -v big_file "[fd00:98f2:b3ff::1]:big_file"
+$ rdpipe "[fd00:98f2:b3ff::1]:> mycopy" < big_file
+```
+
+A bare IPv6 address works too - the last colon is taken as the host/path separator.
+
 # Notes
 
 Data is sent as-is, so if you need encryption or compression, try piping through `openssl` and `pzstd`. Something like the below.

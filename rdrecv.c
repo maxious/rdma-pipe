@@ -410,45 +410,41 @@ static int gid_is_roce_v2(const char *devname, uint8_t port, int gidx) {
   return strcmp(typebuf, "RoCE v2") == 0;
 }
 
-static struct ibv_context *find_rdma_device_by_ip(uint32_t local_ip,
-                                                   uint8_t *port_out,
-                                                   int *gid_idx_out,
-                                                   union ibv_gid *gid_out) {
-  int num_devices;
-  struct ibv_device **devlist = ibv_get_device_list(&num_devices);
+static void gid_target_from_addr(const struct sockaddr *sa, uint8_t out[16]) {
+  memset(out, 0, 16);
+  if (sa->sa_family == AF_INET) { out[10] = 0xFF; out[11] = 0xFF;
+    memcpy(out + 12, &((const struct sockaddr_in *)sa)->sin_addr, 4); }
+  else if (sa->sa_family == AF_INET6) memcpy(out, &((const struct sockaddr_in6 *)sa)->sin6_addr, 16);
+}
+
+static struct ibv_context *find_rdma_device_by_gid(const uint8_t *gid_target,
+                                                   uint8_t *port_out, int *gid_idx_out, union ibv_gid *gid_out) {
+  int num_devices; struct ibv_device **devlist = ibv_get_device_list(&num_devices);
   if (!devlist) return NULL;
-
+  struct ibv_context *fallback_ctx = NULL; uint8_t fallback_port = 0; int fallback_gidx = 0; union ibv_gid fallback_gid;
   for (int i = 0; i < num_devices; i++) {
-    struct ibv_context *ctx = ibv_open_device(devlist[i]);
-    if (!ctx) continue;
-    struct ibv_device_attr attr;
-    if (ibv_query_device(ctx, &attr)) { ibv_close_device(ctx); continue; }
-
+    struct ibv_context *ctx = ibv_open_device(devlist[i]); if (!ctx) continue;
+    struct ibv_device_attr attr; if (ibv_query_device(ctx, &attr)) { ibv_close_device(ctx); continue; }
     for (uint8_t port = 1; port <= attr.phys_port_cnt; port++) {
-      struct ibv_port_attr pattr;
-      if (ibv_query_port(ctx, port, &pattr)) continue;
+      struct ibv_port_attr pattr; if (ibv_query_port(ctx, port, &pattr)) continue;
       if (pattr.state != IBV_PORT_ACTIVE) continue;
-
       for (int gidx = 0; gidx < pattr.gid_tbl_len; gidx++) {
-        union ibv_gid gid;
-        if (ibv_query_gid(ctx, port, gidx, &gid)) continue;
-        if (gid.raw[10] == 0xFF && gid.raw[11] == 0xFF) {
-          uint32_t gid_ip;
-          memcpy(&gid_ip, &gid.raw[12], 4);
-          if (gid_ip == local_ip &&
-              gid_is_roce_v2(ibv_get_device_name(devlist[i]), port, gidx)) {
-            *port_out    = port;
-            *gid_idx_out = gidx;
-            *gid_out     = gid;
-            ibv_free_device_list(devlist);
-            return ctx;
-          }
+        union ibv_gid gid; if (ibv_query_gid(ctx, port, gidx, &gid)) continue;
+        union ibv_gid zero = { .raw = { 0 } };
+        int v4m = gid_target[10] == 0xFF && gid_target[11] == 0xFF && memcmp(gid_target, zero.raw, 10) == 0;
+        if (memcmp(gid.raw, gid_target, 16) == 0 && (!v4m || gid_is_roce_v2(ibv_get_device_name(devlist[i]), port, gidx))) {
+          *port_out = port; *gid_idx_out = gidx; *gid_out = gid;
+          ibv_free_device_list(devlist); return ctx;
+        }
+        if (!fallback_ctx && !v4m && memcmp(gid.raw, zero.raw, 16) != 0) {
+          fallback_ctx = ctx; fallback_port = port; fallback_gidx = gidx; fallback_gid = gid;
         }
       }
     }
-    ibv_close_device(ctx);
+    if (fallback_ctx != ctx) ibv_close_device(ctx);
   }
   ibv_free_device_list(devlist);
+  if (fallback_ctx) { *port_out = fallback_port; *gid_idx_out = fallback_gidx; *gid_out = fallback_gid; return fallback_ctx; }
   return NULL;
 }
 
@@ -487,7 +483,7 @@ int main(int argc, char *argv[]) {
   }
 
   /* TCP: accept and receive params */
-  int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
+  int listen_sock = socket(AF_INET6, SOCK_STREAM, 0);
   if (listen_sock < 0) {
     fprintf(stderr, "rdrecv: socket creation failed: %s\n", strerror(errno));
     close(fd);
@@ -496,8 +492,8 @@ int main(int argc, char *argv[]) {
   int optval = 1;
   if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
     fprintf(stderr, "rdrecv: setsockopt(SO_REUSEADDR) failed: %s\n", strerror(errno));
-  struct sockaddr_in sin = { .sin_family = AF_INET, .sin_port = htons(port),
-                             .sin_addr.s_addr = INADDR_ANY };
+  struct sockaddr_in6 sin = { .sin6_family = AF_INET6, .sin6_port = htons(port),
+                              .sin6_addr = in6addr_any };
   if (bind(listen_sock, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
     fprintf(stderr, "rdrecv: bind to TCP port %d failed: %s\n", port, strerror(errno));
     close(listen_sock); close(fd);
@@ -509,7 +505,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  struct sockaddr_in peer_addr;
+  struct sockaddr_in6 peer_addr;
   socklen_t peer_len = sizeof(peer_addr);
   int tcp_sock = accept(listen_sock, (struct sockaddr *)&peer_addr, &peer_len);
   close(listen_sock);
@@ -521,8 +517,8 @@ int main(int argc, char *argv[]) {
   double connect_time = now_sec();
   _ts_ref = connect_time;
   if (verbose) {
-    char peer_ip[INET_ADDRSTRLEN] = "?";
-    inet_ntop(AF_INET, &peer_addr.sin_addr, peer_ip, sizeof(peer_ip));
+    char peer_ip[INET6_ADDRSTRLEN] = "?";
+    inet_ntop(peer_addr.sin6_family, &peer_addr.sin6_addr, peer_ip, sizeof(peer_ip));
     fprintf(stderr, "Sender %s connected after waiting %.3f s\n",
             peer_ip, connect_time - _ts0);
   }
@@ -723,14 +719,16 @@ int main(int argc, char *argv[]) {
   }
 
   /* RDMA device */
-  struct sockaddr_in local_addr;
+  struct sockaddr_in6 local_addr;
   socklen_t local_len = sizeof(local_addr);
   getsockname(tcp_sock, (struct sockaddr *)&local_addr, &local_len);
+  uint8_t gid_target[16];
+  gid_target_from_addr((struct sockaddr *)&local_addr, gid_target);
 
   uint8_t port_num; int gid_idx; union ibv_gid local_gid;
   struct ibv_context *ctx =
-      find_rdma_device_by_ip(local_addr.sin_addr.s_addr, &port_num, &gid_idx, &local_gid);
-  if (!ctx) { fprintf(stderr, "rdrecv: no active RoCEv2 GID matches the local TCP interface IP; check link state, IP assignment, and GID table\n"); return 1; }
+      find_rdma_device_by_gid(gid_target, &port_num, &gid_idx, &local_gid);
+  if (!ctx) { fprintf(stderr, "rdrecv: no active GID matches the local TCP interface address; check link state, IP assignment, and GID table\n"); return 1; }
 
   struct ibv_pd *pd = ibv_alloc_pd(ctx);
   if (!pd) { fprintf(stderr, "rdrecv: ibv_alloc_pd failed: %s\n", strerror(errno)); return 1; }
